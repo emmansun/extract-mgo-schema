@@ -14,6 +14,11 @@ import (
 	cli "gopkg.in/urfave/cli.v1"
 )
 
+const (
+	CSVFormat  = "csv"
+	JSONFormat = "json"
+)
+
 type commandInfo struct {
 	url    string
 	output string
@@ -22,8 +27,8 @@ type commandInfo struct {
 }
 
 type docField struct {
-	Name string
-	Type string
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type docSchema []docField
@@ -42,7 +47,7 @@ var (
 	formatFlag = cli.StringFlag{
 		Name:  "format",
 		Usage: "Output file format. Can be \"json\" or \"csv\". Default is \"json\"",
-		Value: "json",
+		Value: JSONFormat,
 	}
 )
 
@@ -66,9 +71,21 @@ func getStructureSchema(prefix string, object bson.D, schema *docSchema) {
 		}
 		switch v.Value.(type) {
 		case int:
+		case int8:
+		case int16:
+		case int32:
+		case int64:
+		case uint:
+		case uint8:
+		case uint16:
+		case uint32:
+		case uint64:
+			field.Type = "INTEGER"
+			addIfNotExists(schema, field)
+			break
 		case float32:
 		case float64:
-			field.Type = "NUMBER"
+			field.Type = "DECIMAL"
 			addIfNotExists(schema, field)
 			break
 		case string:
@@ -88,6 +105,7 @@ func getStructureSchema(prefix string, object bson.D, schema *docSchema) {
 			addIfNotExists(schema, field)
 			break
 		case bson.Binary:
+		case []uint8:
 			field.Type = "BINARY"
 			addIfNotExists(schema, field)
 		case bson.D:
@@ -165,6 +183,10 @@ func exportCSV(cmdInfo *commandInfo, schema map[string]docSchema) error {
 }
 
 func extractSchema(ctx *cli.Context) error {
+	if ctx.NumFlags() == 0 {
+		cli.ShowAppHelpAndExit(ctx, -1)
+		return nil
+	}
 	cmdInfo := new(commandInfo)
 	if !ctx.GlobalIsSet(datatabseFlag.Name) {
 		log.Fatalf("%s is mandatory!", datatabseFlag.Name)
@@ -174,8 +196,8 @@ func extractSchema(ctx *cli.Context) error {
 	if ctx.GlobalIsSet(formatFlag.Name) {
 		cmdInfo.format = ctx.GlobalString(formatFlag.Name)
 	}
-	if cmdInfo.format != "json" && cmdInfo.format != "csv" {
-		cmdInfo.format = "json"
+	if cmdInfo.format != JSONFormat && cmdInfo.format != CSVFormat {
+		cmdInfo.format = JSONFormat
 	}
 	if !ctx.GlobalIsSet(outputFlag.Name) {
 		log.Fatalf("%s is mandatory!", outputFlag.Name)
@@ -197,7 +219,7 @@ func extractSchema(ctx *cli.Context) error {
 	}
 	db := session.DB(cmdInfo.dbName)
 	schema := getDbSchema(db)
-	if cmdInfo.format == "json" {
+	if cmdInfo.format == JSONFormat {
 		return exportJSON(cmdInfo, schema)
 	}
 	return exportCSV(cmdInfo, schema)

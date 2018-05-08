@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/globalsign/mgo"
@@ -55,8 +56,6 @@ func (schema docSchema) Swap(i, j int) {
 	schema[j] = temp
 }
 
-var fieldSet map[string]struct{}
-
 var (
 	datatabseFlag = cli.StringFlag{
 		Name:  "database",
@@ -73,14 +72,14 @@ var (
 	}
 )
 
-func addIfNotExists(schema *docSchema, field *docField) {
+func addIfNotExists(schema *docSchema, field *docField, fieldSet map[string]struct{}) {
 	if _, ok := fieldSet[field.Name]; !ok {
 		fieldSet[field.Name] = struct{}{}
 		*schema = append(*schema, *field)
 	}
 }
 
-func getSchema(prefix string, object interface{}, schema *docSchema) {
+func getSchema(prefix string, object interface{}, schema *docSchema, fieldSet map[string]struct{}) {
 	if object == nil {
 		return
 	}
@@ -100,42 +99,42 @@ func getSchema(prefix string, object interface{}, schema *docSchema) {
 	case uint32:
 	case uint64:
 		field.Type = "INTEGER"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case float32:
 	case float64:
 		field.Type = "DECIMAL"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case string:
 		field.Type = "STRING"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case bool:
 		field.Type = "BOOL"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case time.Time:
 		field.Type = "TIME"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case bson.ObjectId:
 		field.Type = "OBJECTID"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		break
 	case bson.Binary:
 	case []uint8:
 		field.Type = "BINARY"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 	case bson.D:
-		getStructureSchema(field.Name, object.(bson.D), schema)
+		getStructureSchema(field.Name, object.(bson.D), schema, fieldSet)
 		break
 	case []interface{}:
 		field.Type = "ARRAY"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		for i, v := range object.([]interface{}) {
 			if i < MaxTryRecords {
-				getSchema(field.Name+"[]", v, schema)
+				getSchema(field.Name+"[]", v, schema, fieldSet)
 			} else {
 				break
 			}
@@ -143,13 +142,13 @@ func getSchema(prefix string, object interface{}, schema *docSchema) {
 		break
 	default:
 		field.Type = "UNKNOWN"
-		addIfNotExists(schema, field)
+		addIfNotExists(schema, field, fieldSet)
 		log.Printf("%v, Unknown=%v\n", field.Name, reflect.TypeOf(object))
 		break
 	}
 }
 
-func getStructureSchema(prefix string, object bson.D, schema *docSchema) {
+func getStructureSchema(prefix string, object bson.D, schema *docSchema, fieldSet map[string]struct{}) {
 	for _, v := range object {
 		if v.Value == nil {
 			continue
@@ -160,36 +159,52 @@ func getStructureSchema(prefix string, object bson.D, schema *docSchema) {
 		} else {
 			name = prefix + "." + v.Name
 		}
-		getSchema(name, v.Value, schema)
+		getSchema(name, v.Value, schema, fieldSet)
 	}
 }
 
-func genCollectionSchema(c *mgo.Collection) docSchema {
-	fieldSet = make(map[string]struct{})
+func genCollectionSchema(wg *sync.WaitGroup, dbSchema map[string]docSchema, c *mgo.Collection) {
+	defer wg.Done()
+	log.Printf("Start extract schema for collection %v.\n", c.Name)
+	defer func() {
+		log.Printf("Extract schema for collection %v end.\n", c.Name)
+	}()
+	fieldSet := make(map[string]struct{})
 	var results []bson.D
 	err := c.Find(bson.M{}).Limit(MaxTryRecords).Sort("-_id").All(&results)
 	if err != nil && err == mgo.ErrNotFound {
-		return docSchema{}
+		dbSchema[c.Name] = docSchema{}
+		return
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	var colSchema = docSchema{}
 	for _, result := range results {
-		getStructureSchema("", result, &colSchema)
+		getStructureSchema("", result, &colSchema, fieldSet)
 	}
-	return colSchema
+	if len(colSchema) > 1 {
+		sort.Sort(colSchema[1:])
+	}
+	dbSchema[c.Name] = colSchema
 }
 
 func getDbSchema(db *mgo.Database) map[string]docSchema {
+	log.Printf("Extract schema for database %v\n", db.Name)
+	defer func(start time.Time) {
+		log.Printf("Extract schema for database %v done, used time %v\n", db.Name, time.Now().Sub(start))
+	}(time.Now())
 	dbSchemas := make(map[string]docSchema)
 	collectionNames, err := db.CollectionNames()
 	if err != nil {
 		log.Fatal(err)
 	}
+	var wg sync.WaitGroup
+	wg.Add(len(collectionNames))
 	for _, collectionName := range collectionNames {
-		dbSchemas[collectionName] = genCollectionSchema(db.C(collectionName))
+		go genCollectionSchema(&wg, dbSchemas, db.C(collectionName))
 	}
+	wg.Wait()
 	return dbSchemas
 }
 
@@ -220,14 +235,6 @@ func exportCSV(cmdInfo *commandInfo, schema map[string]docSchema) error {
 	}
 	writer.Flush()
 	return nil
-}
-
-func sortCollectionSchema(schema map[string]docSchema) {
-	for _, colSchema := range schema {
-		if len(colSchema) > 1 {
-			sort.Sort(colSchema[1:])
-		}
-	}
 }
 
 func extractSchema(ctx *cli.Context) error {
@@ -267,7 +274,6 @@ func extractSchema(ctx *cli.Context) error {
 	}
 	db := session.DB(cmdInfo.dbName)
 	schema := getDbSchema(db)
-	sortCollectionSchema(schema)
 	if cmdInfo.format == JSONFormat {
 		return exportJSON(cmdInfo, schema)
 	}

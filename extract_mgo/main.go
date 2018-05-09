@@ -22,6 +22,7 @@ const (
 	JSONFormat = "json"
 
 	MaxTryRecords = 100
+	MaxGoRoutines = 4
 )
 
 type commandInfo struct {
@@ -71,6 +72,8 @@ var (
 		Value: JSONFormat,
 	}
 )
+
+var tasks chan string
 
 func addIfNotExists(schema *docSchema, field *docField, fieldSet map[string]struct{}) {
 	if _, ok := fieldSet[field.Name]; !ok {
@@ -163,12 +166,7 @@ func getStructureSchema(prefix string, object bson.D, schema *docSchema, fieldSe
 	}
 }
 
-func genCollectionSchema(wg *sync.WaitGroup, dbSchema map[string]docSchema, c *mgo.Collection) {
-	defer wg.Done()
-	log.Printf("Start extract schema for collection %v.\n", c.Name)
-	defer func() {
-		log.Printf("Extract schema for collection %v end.\n", c.Name)
-	}()
+func genCollectionSchema(dbSchema map[string]docSchema, c *mgo.Collection) {
 	fieldSet := make(map[string]struct{})
 	var results []bson.D
 	err := c.Find(bson.M{}).Limit(MaxTryRecords).Sort("-_id").All(&results)
@@ -199,12 +197,34 @@ func getDbSchema(db *mgo.Database) map[string]docSchema {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var wg sync.WaitGroup
-	wg.Add(len(collectionNames))
-	for _, collectionName := range collectionNames {
-		go genCollectionSchema(&wg, dbSchemas, db.C(collectionName))
+	if len(collectionNames) > 0 {
+		var done sync.WaitGroup
+		tasks = make(chan string, len(collectionNames))
+		for _, collectionName := range collectionNames {
+			tasks <- collectionName
+		}
+		close(tasks)
+		routines := MaxGoRoutines
+		if routines > len(collectionNames) {
+			routines = len(collectionNames)
+		}
+		for i := 1; i <= MaxGoRoutines; i++ {
+			done.Add(1)
+			go func(i int) {
+				for {
+					collectionName, ok := <-tasks
+					if !ok {
+						done.Done()
+						return
+					}
+					startTime := time.Now()
+					genCollectionSchema(dbSchemas, db.C(collectionName))
+					log.Printf("Go Routine %v, Extract schema for collection %v, used time %v.\n", i, collectionName, time.Now().Sub(startTime))
+				}
+			}(i)
+		}
+		done.Wait()
 	}
-	wg.Wait()
 	return dbSchemas
 }
 
